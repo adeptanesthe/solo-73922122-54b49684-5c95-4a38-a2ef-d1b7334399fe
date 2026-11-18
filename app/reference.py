@@ -57,4 +57,42 @@ def dense_reference_grads(
     return out_ref.detach(), gq, gk, gv
 
 
-__all__ = ["HEAD_DIM", "dense_reference", "dense_reference_grads"]
+def compressed_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    doc_ids: torch.Tensor,
+    scale: float,
+    keep: torch.Tensor,
+) -> torch.Tensor:
+    """KV 缓存压缩后的文档内因果注意力，返回不带梯度的输出。
+
+    ``keep[j] = True`` 表示历史 key j 保留在缓存中。每个 query 始终读取自身；
+    其余只能读取同一篇文档中、不晚于自己、且被保留的 key。删除 key 后 softmax
+    在剩余 key 上重新归一化。使用完整 N x N 掩码与手写 softmax，作为独立回算。
+    """
+    n = q.shape[0]
+    if keep.shape != (n,):
+        raise ValueError("keep 必须是一维布尔张量且长度等于 token 总数")
+    keep = keep.to(dtype=torch.bool)
+
+    pos = torch.arange(n, dtype=torch.int64)
+    same_doc = doc_ids[:, None] == doc_ids[None, :]
+    causal = pos[None, :] <= pos[:, None]
+    self_key = pos[None, :] == pos[:, None]
+    valid = same_doc & causal & (self_key | keep[None, :])
+
+    scores = scale * (q @ k.T)
+    scores = torch.where(valid, scores, NEG_INF)
+    row_max = torch.amax(scores, dim=1, keepdim=True)
+    exp_scores = torch.where(valid, torch.exp(scores - row_max), 0.0)
+    probs = exp_scores / torch.sum(exp_scores, dim=1, keepdim=True)
+    return probs @ v
+
+
+__all__ = [
+    "HEAD_DIM",
+    "compressed_reference",
+    "dense_reference",
+    "dense_reference_grads",
+]
